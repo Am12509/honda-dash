@@ -106,7 +106,11 @@ class Engine(private val events: (String) -> Unit) {
                         }
                     }
                 }
-                Derived.compute(values)
+                // only values read in this cycle feed the derived values (a value left from another screen is stale)
+                val live = HashSet<String>()
+                for (p in pids) { val st = stamps[p.key]; if (st != null && st >= start) live.add(p.key) }
+                Derived.compute(values, live)
+                values[Derived.RATE] = requestsPerSecond
                 cycleMs = System.currentTimeMillis() - start
                 logger?.row(values)
                 val now = System.currentTimeMillis()

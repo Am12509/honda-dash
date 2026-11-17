@@ -17,7 +17,9 @@ import java.util.Locale
  * Every row is flushed, so a log survives the head unit losing power. When the log stops, a copy goes to
  * Download/HondaDash (best effort). The Logs screen can share any log directly.
  */
-class CsvLogger(context: Context, private val keys: List<String>, tag: String) {
+class CsvLogger(context: Context, keyList: List<String>, tag: String) {
+    /** Every log also records the link rate, so a slow adapter shows up in the file. */
+    private val keys: List<String> = (keyList + Derived.RATE).distinct()
     val file: File
     val fileName: String get() = file.name
     private val out: OutputStreamWriter

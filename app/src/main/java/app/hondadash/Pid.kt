@@ -39,23 +39,29 @@ object Derived {
     const val GEAR_CALC = "D_GEAR"     // gear from mainshaft / countershaft ratio
     const val TGAP = "D_TGAP"          // map timing minus final timing, degrees
     const val FUEL_FLOW = "D_FFLOW"    // fuel per injection x rpm, raw flow index until the scale is proven
+    const val RATE = "D_RATE"          // adapter requests per second, logged so link speed is visible
     val names = mapOf(SLIP to "Converter slip(%)", GEAR_CALC to "Gear (from shafts)",
-        TGAP to "Timing removed(deg)", FUEL_FLOW to "Fuel flow index (raw)")
+        TGAP to "Timing removed(deg)", FUEL_FLOW to "Fuel flow index (raw)", RATE to "Link rate(req/s)")
 
     // Mainshaft / countershaft ratio per gear, proven from Log C1 (17 Nov 2026).
     private val ratios = doubleArrayOf(2.656, 1.516, 1.082, 0.772, 0.566)
 
-    fun compute(v: MutableMap<String, Double>) {
-        val eng = v["GB_RPM"]
-        val main = v["MAINSHAFT"]
-        val cs = v["COUNTERSHAFT"]
-        val tm = v["T_MAP"]
-        val tf = v["T_FIN"]
-        if (tm != null && tf != null) v[TGAP] = tm - tf
-        val fe = v["FUEL_EVT"]
-        val rpm = v["RPM_E"]
-        if (fe != null && rpm != null) v[FUEL_FLOW] = fe * rpm / 1000.0
-        if (eng != null && main != null && eng > 300) v[SLIP] = (eng - main) / eng * 100.0
+    /**
+     * Works out the derived values from inputs read in the current poll cycle only ([live]).
+     * A value left over from another screen is never used, and a derived value whose inputs are not live is removed.
+     */
+    fun compute(v: MutableMap<String, Double>, live: Set<String>) {
+        fun g(k: String): Double? = if (k in live) v[k]?.takeIf { !it.isNaN() } else null
+        val eng = g("GB_RPM")
+        val main = g("MAINSHAFT")
+        val cs = g("COUNTERSHAFT")
+        val tm = g("T_MAP")
+        val tf = g("T_FIN")
+        if (tm != null && tf != null) v[TGAP] = tm - tf else v.remove(TGAP)
+        val fe = g("FUEL_EVT")
+        val rpm = g("RPM_E")
+        if (fe != null && rpm != null) v[FUEL_FLOW] = fe * rpm / 1000.0 else v.remove(FUEL_FLOW)
+        if (eng != null && main != null && eng > 300) v[SLIP] = (eng - main) / eng * 100.0 else v.remove(SLIP)
         if (main != null && cs != null && cs > 150) {
             val r = main / cs
             var best = 0
@@ -65,7 +71,7 @@ object Derived {
                 if (e < bestErr) { bestErr = e; best = i }
             }
             v[GEAR_CALC] = if (bestErr < 0.04) (best + 1).toDouble() else 0.0
-        }
+        } else v.remove(GEAR_CALC)
     }
 
     /** Lock-up state byte C419. Meanings inferred from Log C2 (17 Nov 2026). */
