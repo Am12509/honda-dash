@@ -1,0 +1,82 @@
+package app.hondadash
+
+/** One readable value. [request] is the hex request sent to the ECU, for example "22D742" or "010C". */
+class Pid(
+    val key: String,
+    val name: String,
+    val short: String,
+    val request: String,
+    val equation: String,
+    val unit: String,
+    val min: Double,
+    val max: Double,
+    val decimals: Int,
+) {
+    val expr: Expr by lazy { Expr(equation) }
+
+    /** Number of bytes the reply echoes before the data: mode 22 echoes 2 address bytes, mode 01 echoes the PID. */
+    val echoBytes: Int get() = (request.length / 2) - 1
+
+    fun format(v: Double?): String {
+        if (v == null || v.isNaN()) return "--"
+        return when (decimals) {
+            0 -> Math.round(v).toString()
+            1 -> String.format("%.1f", v)
+            else -> String.format("%.2f", v)
+        }
+    }
+}
+
+object Pids {
+    val byKey: Map<String, Pid> = PidTable.all.associateBy { it.key }
+    operator fun get(key: String): Pid? = byKey[key]
+}
+
+/** Values the app works out itself from other values. */
+object Derived {
+    const val SLIP = "D_SLIP"          // torque converter slip, percent
+    const val LU_TEXT = "D_LU"         // lock-up state as text index
+    const val GEAR_CALC = "D_GEAR"     // gear from mainshaft / countershaft ratio
+    const val TGAP = "D_TGAP"          // map timing minus final timing, degrees
+    const val FUEL_FLOW = "D_FFLOW"    // fuel per injection x rpm, raw flow index until the scale is proven
+    val names = mapOf(SLIP to "Converter slip(%)", GEAR_CALC to "Gear (from shafts)",
+        TGAP to "Timing removed(deg)", FUEL_FLOW to "Fuel flow index (raw)")
+
+    // Mainshaft / countershaft ratio per gear, proven from Log C1 (17 Nov 2026).
+    private val ratios = doubleArrayOf(2.656, 1.516, 1.082, 0.772, 0.566)
+
+    fun compute(v: MutableMap<String, Double>) {
+        val eng = v["GB_RPM"]
+        val main = v["MAINSHAFT"]
+        val cs = v["COUNTERSHAFT"]
+        val tm = v["T_MAP"]
+        val tf = v["T_FIN"]
+        if (tm != null && tf != null) v[TGAP] = tm - tf
+        val fe = v["FUEL_EVT"]
+        val rpm = v["RPM_E"]
+        if (fe != null && rpm != null) v[FUEL_FLOW] = fe * rpm / 1000.0
+        if (eng != null && main != null && eng > 300) v[SLIP] = (eng - main) / eng * 100.0
+        if (main != null && cs != null && cs > 150) {
+            val r = main / cs
+            var best = 0
+            var bestErr = 1e9
+            for (i in ratios.indices) {
+                val e = Math.abs(r - ratios[i]) / ratios[i]
+                if (e < bestErr) { bestErr = e; best = i }
+            }
+            v[GEAR_CALC] = if (bestErr < 0.04) (best + 1).toDouble() else 0.0
+        }
+    }
+
+    /** Lock-up state byte C419. Meanings inferred from Log C2 (17 Nov 2026). */
+    fun lockupText(s: Double?): String = when (s?.toInt()) {
+        0 -> "Off"
+        1 -> "Open"
+        2 -> "Partial lock"
+        3 -> "Released (coast)"
+        4 -> "Coast lock"
+        6 -> "Applying"
+        null -> "--"
+        else -> "State ${s.toInt()}"
+    }
+}
