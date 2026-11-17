@@ -27,7 +27,7 @@ class BluetoothLink(private val device: BluetoothDevice) : Link {
     override val label: String get() = (device.name ?: "Adapter") + " " + device.address
 
     override fun open() {
-        BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
+        try { BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery() } catch (_: Exception) {}
         val spp = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         val attempts = listOf<() -> BluetoothSocket>(
             { device.createInsecureRfcommSocketToServiceRecord(spp) },
