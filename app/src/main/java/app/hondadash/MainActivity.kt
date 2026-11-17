@@ -6,12 +6,12 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.bluetooth.BluetoothManager
 import android.content.ClipData
-import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
@@ -34,132 +34,210 @@ import android.widget.Toast
 import java.io.File
 
 class MainActivity : Activity() {
-    private val engine = Engine { msg -> ui.post { addEvent(msg) } }
+    private val engine get() = Dash.engine
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
     private lateinit var content: FrameLayout
+    private lateinit var header: LinearLayout
+    private lateinit var pill: LinearLayout
+    private lateinit var pillDot: View
     private lateinit var status: TextView
     private lateinit var rate: TextView
     private lateinit var connectBtn: Button
     private lateinit var logBtn: Button
-    private lateinit var topBar: LinearLayout
+    private lateinit var shiftBar: ShiftBarView
     private val tabButtons = ArrayList<Button>()
-    private val events = ArrayList<String>()
     private var eventsView: TextView? = null
     private var terminalOut: TextView? = null
-    private var tone: ToneGenerator? = null
-    private var lastAlarm = 0L
+    private var resumed = false
+    /** Text size factor: a bit bigger on the head unit's large low-density screen, normal on a phone. */
+    private var uiScale = 1f
 
     // bindings of the visible screen
     private val gauges = ArrayList<GaugeView>()
     private val tiles = ArrayList<Pair<TileView, (Double?) -> String>>()
     private val lamps = ArrayList<LampView>()
     private val bars = ArrayList<BarView>()
+    private var rpmGauge: GaugeView? = null
+    private var speedGauge: GaugeView? = null
+    private var coolantGauge: GaugeView? = null
     private var currentPage = 0
+    private var lastState: Engine.State? = null
 
     private val CORE_LOG = listOf("RPM_E", "SPEED", "TPS", "GEAR", "ECT_F", "T_FIN")
 
-    private class Page(val title: String, val keys: List<String>, val build: (LinearLayout) -> Unit)
+    private class Page(val title: String, val keys: List<String>, val fast: Set<String> = emptySet(), val build: (LinearLayout) -> Unit)
     private lateinit var pages: List<Page>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = getSharedPreferences("hondadash", Context.MODE_PRIVATE)
-        engine.fastMode = prefs.getBoolean("fast", true)
+        prefs = Dash.prefs(this)
+        Theme.set(prefs.getString("theme", "papaya"))
+        uiScale = if (resources.configuration.smallestScreenWidthDp >= 600) 1.2f else 1f
+        // first start after the update: keep auto connect on if an adapter was already chosen
+        if (!prefs.contains("want")) prefs.edit().putBoolean("want", prefs.getString("addr", null) != null || prefs.getBoolean("demo", false)).apply()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        try { tone = ToneGenerator(AudioManager.STREAM_ALARM, 90) } catch (_: Exception) {}
         pages = buildPages()
         setContentView(buildRoot())
         showPage(prefs.getInt("page", 0).coerceIn(0, pages.size - 1))
-        if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
-        } else autoConnect()
+        Dash.listener = { s -> onEvent(s) }
+        val need = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED)
+            need.add(Manifest.permission.BLUETOOTH_CONNECT)
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            need.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1) else Dash.startService(this)
         ui.post(tick)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        autoConnect()
+        Dash.startService(this)
     }
 
     @Suppress("DEPRECATION")
     override fun onResume() {
         super.onResume()
+        resumed = true
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
             or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE)
+        // the head unit woke up: make sure the service runs and retries at once
+        if (prefs.getBoolean("want", false)) {
+            Dash.startService(this)
+            if (engine.state == Engine.State.WAITING) engine.retryNow()
+        }
+    }
+
+    override fun onPause() {
+        resumed = false
+        super.onPause()
     }
 
     override fun onDestroy() {
         ui.removeCallbacks(tick)
-        stopLog()
-        engine.stop()
-        tone?.release()
+        Dash.listener = null
         super.onDestroy()
     }
 
     // ------------------------------------------------------------------ layout
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun dpf(v: Float): Float = v * resources.displayMetrics.density
+
+    private fun onAccent(): Int {
+        val a = Theme.ACCENT
+        val lum = (0.299 * Color.red(a) + 0.587 * Color.green(a) + 0.114 * Color.blue(a)) / 255
+        return if (lum > 0.6) Theme.BG else Color.WHITE
+    }
+
+    private fun styled(b: Button, size: Float, color: Int, bg: GradientDrawable) {
+        b.isAllCaps = false
+        b.textSize = size
+        b.typeface = Theme.TECH
+        b.setTextColor(color)
+        b.background = bg
+        b.minHeight = 0; b.minimumHeight = 0; b.minWidth = 0; b.minimumWidth = 0
+        b.stateListAnimator = null
+        b.setPadding(dp(12), 0, dp(12), 0)
+    }
 
     private fun buildRoot(): View {
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Theme.BG) }
-        topBar = LinearLayout(this).apply {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val a = Theme.ACCENT
+        root.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(
+            Color.rgb((9 + Color.red(a) * 0.09).toInt(), (11 + Color.green(a) * 0.09).toInt(), (16 + Color.blue(a) * 0.09).toInt()),
+            Color.rgb(9, 11, 16), Color.rgb(5, 6, 8)))
+
+        shiftBar = ShiftBarView(this)
+        root.addView(shiftBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)))
+
+        header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), 0, dp(8), 0)
-            setBackgroundColor(Color.rgb(18, 16, 20))
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            background = Theme.fill(Theme.withAlpha(Theme.BAR, 235), dpf(14f), Color.argb(26, 255, 255, 255))
         }
-        status = TextView(this).apply { setTextColor(Theme.TEXT); textSize = 15f }
-        rate = TextView(this).apply { setTextColor(Theme.DIM); textSize = 13f; setPadding(dp(16), 0, dp(16), 0) }
-        connectBtn = smallButton("Connect") { onConnectPressed() }
-        logBtn = smallButton("Start log") { if (engine.logger == null) startLog() else stopLog() }
-        topBar.addView(status, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply { gravity = Gravity.CENTER_VERTICAL })
-        topBar.addView(rate)
-        topBar.addView(logBtn)
-        topBar.addView(connectBtn)
-        status.gravity = Gravity.CENTER_VERTICAL
-        root.addView(topBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)))
+        pill = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(12), 0, dp(14), 0) }
+        pillDot = View(this)
+        status = TextView(this).apply { typeface = Theme.TECH; textSize = 15f; setPadding(dp(8), 0, 0, 0); isSingleLine = true }
+        pill.addView(pillDot, LinearLayout.LayoutParams(dp(10), dp(10)))
+        pill.addView(status)
+        rate = TextView(this).apply { setTextColor(Theme.DIM2); typeface = Theme.MONO; textSize = 12f; setPadding(dp(12), 0, dp(8), 0); isSingleLine = true }
+        header.addView(pill, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        header.addView(rate, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // theme dots
+        val dots = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), 0, dp(6), 0)
+            background = Theme.fill(Color.argb(128, 0, 0, 0), dpf(12f), Color.argb(26, 255, 255, 255))
+        }
+        for (pal in Theme.palettes) {
+            val d = View(this)
+            d.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(pal.accent)
+                if (pal.id == Theme.current.id) setStroke(dp(2), Color.WHITE)
+            }
+            d.setOnClickListener { applyTheme(pal.id) }
+            dots.addView(d, LinearLayout.LayoutParams(dp(20), dp(20)).apply { setMargins(dp(4), 0, dp(4), 0) })
+        }
+        header.addView(dots, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT).apply { setMargins(0, dp(2), dp(8), dp(2)) })
+        logBtn = Button(this).apply { text = "Start log"; setOnClickListener { if (engine.logger == null) startLog() else stopLog() } }
+        styled(logBtn, 15f, Theme.TEXT, Theme.fill(Color.argb(16, 255, 255, 255), dpf(12f), Color.argb(26, 255, 255, 255)))
+        connectBtn = Button(this).apply { text = "Connect"; setOnClickListener { onConnectPressed() } }
+        styled(connectBtn, 15f, onAccent(), Theme.fill(Theme.ACCENT, dpf(12f)))
+        header.addView(logBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT).apply { setMargins(0, 0, dp(8), 0) })
+        header.addView(connectBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { setMargins(dp(6), dp(4), dp(6), 0) })
 
         content = FrameLayout(this)
         root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.rgb(18, 16, 20)) }
-        pages.forEachIndexed { i, p ->
-            val b = Button(this).apply {
-                text = p.title
-                isAllCaps = false
-                textSize = 15f
-                setTextColor(Theme.TEXT)
-                setBackgroundColor(Color.TRANSPARENT)
-                setOnClickListener { showPage(i) }
-            }
-            tabButtons.add(b)
-            tabs.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            background = Theme.fill(Theme.withAlpha(Theme.BAR, 242), dpf(14f), Color.argb(26, 255, 255, 255))
         }
-        root.addView(tabs, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)))
+        tabButtons.clear()
+        pages.forEachIndexed { i, p ->
+            val b = Button(this).apply { text = p.title; setOnClickListener { showPage(i) } }
+            styled(b, 15f * uiScale, Theme.DIM, Theme.fill(Color.TRANSPARENT, dpf(10f)))
+            b.setPadding(dp(2), 0, dp(2), 0)
+            b.isSingleLine = uiScale > 1f  // head unit: one line; phone: may wrap to two lines as before
+            tabButtons.add(b)
+            tabs.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply { setMargins(dp(2), 0, dp(2), 0) })
+        }
+        root.addView(tabs, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(if (uiScale > 1f) 62 else 56)).apply { setMargins(dp(6), 0, dp(6), dp(6)) })
         return root
     }
 
-    private fun smallButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
-        text = label
-        isAllCaps = false
-        textSize = 14f
-        setTextColor(Theme.TEXT)
-        setBackgroundColor(Color.rgb(60, 24, 20))
-        setOnClickListener { onClick() }
-        setPadding(dp(14), 0, dp(14), 0)
+    private fun applyTheme(id: String) {
+        prefs.edit().putString("theme", id).apply()
+        Theme.set(id)
+        setContentView(buildRoot())
+        showPage(currentPage)
+        lastState = null
+        loggingShown = false
+        headerRed = false
     }
 
     private fun showPage(i: Int) {
         currentPage = i
         prefs.edit().putInt("page", i).apply()
         gauges.clear(); tiles.clear(); lamps.clear(); bars.clear()
+        rpmGauge = null; speedGauge = null; coolantGauge = null
         eventsView = null; terminalOut = null
         content.removeAllViews()
-        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(6), dp(6), dp(6), dp(6)) }
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), dp(4), dp(4), dp(4)) }
         pages[i].build(body)
         content.addView(body, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        tabButtons.forEachIndexed { k, b -> b.setTextColor(if (k == i) Theme.ACCENT2 else Theme.DIM) }
+        tabButtons.forEachIndexed { k, b ->
+            val on = k == i
+            b.setTextColor(if (on) Theme.ACCENT else Theme.DIM)
+            b.background = if (on) Theme.fill(Theme.withAlpha(Theme.ACCENT, 36), dpf(10f), Theme.withAlpha(Theme.ACCENT, 120))
+                else Theme.fill(Color.TRANSPARENT, dpf(10f))
+        }
+        engine.fast = pages[i].fast
         engine.wanted = pages[i].keys.toSet()
     }
 
@@ -170,13 +248,15 @@ class MainActivity : Activity() {
         parent.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, weight))
     }
 
-    private fun gauge(key: String, label: String, min: Double, max: Double, red: Double? = null): GaugeView =
-        GaugeView(this, key, label, min, max, red).also { gauges.add(it) }
+    private fun gauge(key: String, title: String, unit: String, min: Double, max: Double, major: Double, minor: Int,
+                      red: Double? = null, label: (Double) -> String = { Math.round(it).toString() }): GaugeView =
+        GaugeView(this, key, title, unit, min, max, major, minor, red, 0, label).also { gauges.add(it) }
 
-    private fun tile(key: String, label: String? = null, above: Double? = null, below: Double? = null,
-                     text: ((Double?) -> String)? = null): TileView {
+    private fun tile(key: String, label: String? = null, above: Double? = null, below: Double? = null, tag: String = "",
+                     style: Int = TileView.NUMBER, barMax: Double? = null, text: ((Double?) -> String)? = null): TileView {
         val p = Pids[key]
-        val t = TileView(this, key, label ?: p?.short ?: (Derived.names[key] ?: key), p?.unit ?: "", above, below)
+        val unit = if (key == Derived.TGAP) "deg" else p?.unit ?: ""
+        val t = TileView(this, key, label ?: p?.short ?: (Derived.names[key] ?: key), unit, above, below, tag, style, barMax)
         val f: (Double?) -> String = text ?: { v ->
             if (p != null) p.format(v) else if (v == null || v.isNaN()) "--" else String.format("%.1f", v)
         }
@@ -192,19 +272,13 @@ class MainActivity : Activity() {
 
     private fun cmdButton(label: String, code: String): Button = Button(this).apply {
         text = label
-        isAllCaps = false
-        textSize = 16f
-        setTextColor(Theme.TEXT)
-        setBackgroundColor(Color.rgb(70, 26, 22))
+        styled(this, 16f, Theme.TEXT, Theme.fill(Theme.withAlpha(Theme.ACCENT, 34), dpf(12f), Theme.withAlpha(Theme.ACCENT, 110)))
         setOnClickListener { sendCommand(label, code) }
     }
 
     private fun actionButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
         text = label
-        isAllCaps = false
-        textSize = 16f
-        setTextColor(Theme.TEXT)
-        setBackgroundColor(Color.rgb(40, 40, 48))
+        styled(this, 16f, Theme.TEXT, Theme.fill(Color.argb(16, 255, 255, 255), dpf(12f), Color.argb(26, 255, 255, 255)))
         setOnClickListener { onClick() }
     }
 
@@ -213,6 +287,13 @@ class MainActivity : Activity() {
         setTextColor(Theme.DIM)
         textSize = 14f
         gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(6), 0, dp(6), 0)
+    }
+
+    private fun panel(child: View): ScrollView = ScrollView(this).apply {
+        background = Theme.card(dpf(14f))
+        setPadding(dp(4), dp(4), dp(4), dp(4))
+        addView(child)
     }
 
     // ------------------------------------------------------------------ screens
@@ -224,12 +305,21 @@ class MainActivity : Activity() {
     private val gearText: (Double?) -> String = { v -> when (v?.toInt()) { null -> "--"; 0 -> "P/N"; 6 -> "R"; else -> v.toInt().toString() } }
 
     private fun buildPages(): List<Page> = listOf(
-        Page("Drive", listOf("RPM_E", "SPEED", "ECT_F", "GEAR", "MODE", "STFT", "LTFT", "T_FIN", "T_MAP", "TPS", "IAT", "LU_STATE", "POP_LVL")) { b ->
-            row(b, 2.2f, gauge("RPM_E", "rpm", 0.0, 7000.0, 6300.0), gauge("SPEED", "km/h", 0.0, 200.0),
-                gauge("ECT_F", "coolant F", 100.0, 260.0, 225.0))
-            row(b, 1f, tile("GEAR", "Gear", text = gearText), tile("MODE", "Mode", text = modeText), tile("POP_LVL", "Pops", text = popText),
-                tile("LU_STATE", "Lock-up", text = luText), tile(Derived.TGAP, "Timing removed"))
-            row(b, 1f, tile("STFT"), tile("LTFT", above = 15.0), tile("T_FIN", "Timing"), tile("TPS"), tile("IAT"))
+        Page("Drive", listOf("RPM_E", "SPEED", "ECT_F", "GEAR", "MODE", "STFT", "LTFT", "T_FIN", "T_MAP", "TPS", "IAT", "LU_STATE", "POP_LVL", "VTEC"),
+            setOf("RPM_E", "SPEED", "VTEC")) { b ->
+            val r = gauge("RPM_E", "Tachometer x1000", "RPM", 0.0, 8000.0, 1000.0, 5, 6500.0) { (Math.round(it) / 1000).toString() }
+            val s = gauge("SPEED", "Speedometer", "KM/H", 0.0, 240.0, 20.0, 4)
+            val c = gauge("ECT_F", "Coolant temp", "COOLANT F", 100.0, 260.0, 20.0, 4, 225.0)
+            rpmGauge = r; speedGauge = s; coolantGauge = c
+            // short screens (phone in landscape): smaller dials, taller cards
+            row(b, if (resources.configuration.screenHeightDp < 500) 2.2f else 2.7f, r, s, c)
+            row(b, 1f, tile("GEAR", "Gear", tag = "5AT", style = TileView.ACCENT, text = gearText),
+                tile("MODE", "Mode", tag = "ECU", style = TileView.WORD, text = modeText),
+                tile("POP_LVL", "Pops", tag = "LEVEL", style = TileView.WORD, text = popText),
+                tile("LU_STATE", "Lock-up", tag = "TCC", style = TileView.WORD, text = luText),
+                tile(Derived.TGAP, "Timing removed", tag = "MAP-FINAL"))
+            row(b, 1f, tile("STFT", "STFT", tag = "B1"), tile("LTFT", "LTFT", above = 15.0, tag = "B1"), tile("T_FIN", "Timing", tag = "IGN"),
+                tile("TPS", "Throttle", tag = "TPS", barMax = 100.0), tile("IAT", "Intake", tag = "IAT"))
         },
         Page("Engine", listOf("T_MAP", "T_FIN", "TIMING", "STFT", "LTFT", "LTFT_E", "MAP", "LOAD", "ECT_F", "IAT", "LAMBDA", "IDLE_F", "VTEC", "LOOP", "FAN", "AC_CLUTCH", "RPM_E")) { b ->
             row(b, 1f, tile("RPM_E"), tile("T_MAP", "Map timing"), tile("T_FIN", "Final timing"), tile(Derived.TGAP, "Removed"), tile("TIMING", "OBD timing"))
@@ -238,8 +328,8 @@ class MainActivity : Activity() {
             row(b, 0.8f, lamp("VTEC"), lamp("LOOP", "Closed loop"), lamp("FAN"), lamp("AC_CLUTCH", "A/C clutch"))
         },
         Page("Pops & modes", listOf("POP_LVL", "POP_TIMSET", "POP_WINSET", "POP_SIG", "POP_TGT", "POP_CNT", "POP_REQ", "POP_FUEL", "POP_ARM", "MODE", "SMODE", "STALL", "BTN_SHIFT", "FAN", "FAN_OVR", "RPM_E", "T_FIN", "GEAR")) { b ->
-            row(b, 1f, tile("POP_LVL", "Pops", text = popText), tile("POP_TGT", "Pop timing"), tile("POP_CNT", "Pop count"),
-                tile("POP_SIG", "Signal", text = sigText), tile("MODE", "Mode", text = modeText), tile("T_FIN", "Timing"))
+            row(b, 1f, tile("POP_LVL", "Pops", style = TileView.WORD, text = popText), tile("POP_TGT", "Pop timing"), tile("POP_CNT", "Pop count"),
+                tile("POP_SIG", "Signal", style = TileView.WORD, text = sigText), tile("MODE", "Mode", style = TileView.WORD, text = modeText), tile("T_FIN", "Timing"))
             row(b, 0.9f, cmdButton("Pops off", "230700"), cmdButton("Mild", "230701"), cmdButton("Medium", "230702"), cmdButton("Full", "230703"),
                 cmdButton("Signal on", "230A00"), cmdButton("Signal off", "230A03"))
             row(b, 0.9f, stepper("Pop timing", "POP_TIMSET", "2308", 0, 20, 1, "deg"), stepper("Pop window", "POP_WINSET", "2309", 0, 40, 5, "x0.1 s"))
@@ -250,8 +340,9 @@ class MainActivity : Activity() {
         },
         Page("Gearbox", listOf("GB_RPM", "MAINSHAFT", "COUNTERSHAFT", "GEAR", "LU_STATE", "TBYTE", "TPS", "SPEED", "SMODE", "X_SHIFT_SCHEDULE_ROW")) { b ->
             row(b, 1.3f, tile("GB_RPM", "Engine rpm"), tile("MAINSHAFT", "Mainshaft"), tile(Derived.SLIP, "Converter slip %", above = 30.0),
-                tile("LU_STATE", "Lock-up", text = luText))
-            row(b, 1f, tile("GEAR", "Gear (ECU)", text = gearText), tile(Derived.GEAR_CALC, "Gear (shafts)", text = { v -> if (v == null || v < 1) "--" else v.toInt().toString() }),
+                tile("LU_STATE", "Lock-up", style = TileView.WORD, text = luText))
+            row(b, 1f, tile("GEAR", "Gear (ECU)", style = TileView.ACCENT, text = gearText),
+                tile(Derived.GEAR_CALC, "Gear (shafts)", style = TileView.ACCENT, text = { v -> if (v == null || v < 1) "--" else v.toInt().toString() }),
                 tile("COUNTERSHAFT", "Countershaft"), tile("SPEED"))
             row(b, 1f, tile("TPS"), tile("TBYTE", "Throttle byte"), tile("X_SHIFT_SCHEDULE_ROW", "Shift row"), lamp("SMODE", "S mode"))
             row(b, 0.5f, note("Lock-up meanings are inferred from logs: Partial lock = light-throttle slip control, Coast lock = locked while lifting off."))
@@ -283,7 +374,7 @@ class MainActivity : Activity() {
 
     /** - / + control for a mode 23 setting. 0 means "use the level default". */
     private fun stepper(label: String, key: String, prefix: String, min: Int, max: Int, firstNonZero: Int, unit: String): View {
-        val box = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Theme.PANEL); gravity = Gravity.CENTER_VERTICAL }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val t = tile(key, label, text = { v -> if (v == null) "--" else if (v.toInt() == 0) "auto" else v.toInt().toString() + " " + unit })
         val minus = actionButton("-") {
             val cur = engine.values[key]?.toInt() ?: 0
@@ -296,7 +387,7 @@ class MainActivity : Activity() {
             sendCommand(label, prefix + String.format("%02X", next.coerceIn(min, max)))
         }
         box.addView(minus, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        box.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2f))
+        box.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2f).apply { setMargins(dp(4), 0, dp(4), 0) })
         box.addView(plus, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         return box
     }
@@ -306,7 +397,7 @@ class MainActivity : Activity() {
         terminalOut = out
         val input = EditText(this).apply {
             hint = "Command, e.g. ATRV or 22D742"
-            setTextColor(Theme.TEXT); setHintTextColor(Theme.DIM); textSize = 16f
+            setTextColor(Theme.TEXT); setHintTextColor(Theme.DIM2); textSize = 16f
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
             setSingleLine()
         }
@@ -317,8 +408,15 @@ class MainActivity : Activity() {
         line.addView(actionButton("Send") { val c = input.text.toString().trim(); if (c.isNotEmpty()) terminal(c) },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         b.addView(line, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.8f))
-        val sv = ScrollView(this).apply { setBackgroundColor(Theme.PANEL); addView(out) }
-        b.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 4f))
+        b.addView(panel(out), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 4f))
+    }
+
+    private fun toggle(label: String, key: String, def: Boolean): Button {
+        val btn = actionButton("") {}
+        fun show() { btn.text = label + ": " + (if (prefs.getBoolean(key, def)) "ON" else "OFF") }
+        show()
+        btn.setOnClickListener { prefs.edit().putBoolean(key, !prefs.getBoolean(key, def)).apply(); show() }
+        return btn
     }
 
     @SuppressLint("MissingPermission")
@@ -329,18 +427,18 @@ class MainActivity : Activity() {
             val bm = getSystemService(BluetoothManager::class.java)
             bm?.adapter?.bondedDevices?.forEach { d -> names.add((d.name ?: "Unknown") to d.address) }
         } catch (e: SecurityException) {
-            addEvent("Bluetooth permission missing")
+            Dash.addEvent("Bluetooth permission missing")
         }
         val saved = prefs.getString("addr", null)
         for ((n, a) in names) {
             list.addView(actionButton((if (a == saved) "* " else "") + n + "\n" + a) {
-                prefs.edit().putString("addr", a).putBoolean("demo", false).apply()
-                connectTo(a)
+                prefs.edit().putString("addr", a).putBoolean("demo", false).putBoolean("want", true).apply()
+                Dash.startService(this, DashService.ACTION_CONNECT)
             }, LinearLayout.LayoutParams(dp(220), ViewGroup.LayoutParams.MATCH_PARENT).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
         }
         list.addView(actionButton("Demo (no car)") {
-            prefs.edit().putBoolean("demo", true).apply()
-            engine.start(DemoLink())
+            prefs.edit().putBoolean("demo", true).putBoolean("want", true).apply()
+            Dash.startService(this, DashService.ACTION_CONNECT)
         }, LinearLayout.LayoutParams(dp(220), ViewGroup.LayoutParams.MATCH_PARENT).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
         val hs = HorizontalScrollView(this).apply { addView(list) }
         b.addView(note("Paired adapters (pair the OBD adapter in Android Bluetooth settings first, PIN usually 1234):"),
@@ -352,12 +450,40 @@ class MainActivity : Activity() {
             prefs.edit().putBoolean("fast", engine.fastMode).apply()
             fast.text = if (engine.fastMode) "Fast mode: ON" else "Fast mode: OFF"
         }
-        row(b, 0.8f, fast, note("Fast mode tells the adapter to stop waiting after the first reply. Turn it off if values stop updating."))
+        row(b, 0.8f, fast, toggle("Connect sound", "snd_connect", true), toggle("Alarm sound", "snd_alarm", true),
+            actionButton("Test sounds") { testSounds() }, actionButton("Exit app") { exitApp() })
+        row(b, 0.8f, *Theme.palettes.map { pal ->
+            Button(this).apply {
+                text = pal.name
+                val on = pal.id == Theme.current.id
+                styled(this, 14f, if (on) Theme.TEXT else pal.accent,
+                    Theme.fill(Theme.withAlpha(pal.accent, if (on) 90 else 24), dpf(12f), Theme.withAlpha(pal.accent, if (on) 255 else 110), if (on) dp(2) else 1))
+                setOnClickListener { applyTheme(pal.id) }
+            }
+        }.toTypedArray())
         val ev = TextView(this).apply { setTextColor(Theme.DIM); textSize = 13f; typeface = Typeface.MONOSPACE; setPadding(dp(8), dp(8), dp(8), dp(8)) }
         eventsView = ev
         refreshEvents()
-        b.addView(ScrollView(this).apply { setBackgroundColor(Theme.PANEL); addView(ev) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.5f))
-        b.addView(note("Honda Dash " + versionName() + "   Logs: Logs tab (copies also go to Download/HondaDash)"), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.4f))
+        b.addView(panel(ev), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.3f))
+        b.addView(note("Honda Dash " + versionName() + "   Fast mode: the adapter stops waiting after the first reply. Turn it off if values stop updating."),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.4f))
+    }
+
+    private fun testSounds() {
+        val t = try { ToneGenerator(AudioManager.STREAM_MUSIC, 100) } catch (_: Exception) { null } ?: return toast("Sound not available")
+        DashService.playConnect(t)
+        ui.postDelayed({ DashService.playAlarm(t) }, 900)
+        ui.postDelayed({ t.release() }, 2000)
+    }
+
+    private fun exitApp() {
+        AlertDialog.Builder(this).setTitle("Exit Honda Dash?")
+            .setMessage("This disconnects and stops auto connect until you press Connect again.")
+            .setPositiveButton("Exit") { _, _ ->
+                Dash.startService(this, DashService.ACTION_EXIT)
+                finish()
+            }
+            .setNegativeButton("Cancel", null).show()
     }
 
     private fun buildLogs(b: LinearLayout) {
@@ -374,12 +500,11 @@ class MainActivity : Activity() {
             val kb = (f.length() + 1023) / 1024
             r.addView(note(f.name.removePrefix("HondaDash_").removeSuffix(".csv") + "   " + kb + " KB").apply { setTextColor(Theme.TEXT) },
                 LinearLayout.LayoutParams(0, dp(52), 3f))
-            r.addView(actionButton("Share") { share(f) }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) })
-            r.addView(actionButton("Delete") { confirmDelete(f) }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) })
+            r.addView(actionButton("Share") { share(f) }, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) })
+            r.addView(actionButton("Delete") { confirmDelete(f) }, LinearLayout.LayoutParams(0, dp(46), 1f).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) })
             list.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-        b.addView(ScrollView(this).apply { setBackgroundColor(Theme.PANEL); addView(list) },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 4f))
+        b.addView(panel(list), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 4f))
     }
 
     private fun share(f: File) {
@@ -415,7 +540,7 @@ class MainActivity : Activity() {
             }
             ui.post {
                 val msg = if (err.isEmpty()) "Copied $ok logs to Download/HondaDash" else "Copied $ok of ${files.size}. Downloads error: $err"
-                addEvent(msg)
+                Dash.addEvent(msg)
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
         }.start()
@@ -425,28 +550,19 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ actions
 
-    private fun autoConnect() {
-        if (prefs.getBoolean("demo", false)) { engine.start(DemoLink()); return }
-        val a = prefs.getString("addr", null)
-        if (a != null) connectTo(a) else addEvent("Pick the OBD adapter in Settings")
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun connectTo(addr: String) {
-        try {
-            val bm = getSystemService(BluetoothManager::class.java)
-            val dev = bm?.adapter?.getRemoteDevice(addr) ?: return toast("Bluetooth not available")
-            engine.start(BluetoothLink(dev))
-        } catch (e: Exception) {
-            toast("Cannot connect: ${e.message}")
-        }
-    }
-
     private fun onConnectPressed() {
-        if (engine.state == Engine.State.CONNECTED || engine.state == Engine.State.CONNECTING) {
-            stopLog()
-            engine.stop()
-        } else autoConnect()
+        if (Dash.active()) {
+            prefs.edit().putBoolean("want", false).apply()
+            Dash.startService(this, DashService.ACTION_DISCONNECT)
+        } else {
+            if (prefs.getString("addr", null) == null && !prefs.getBoolean("demo", false)) {
+                toast("Pick the OBD adapter in Settings")
+                showPage(pages.indexOfFirst { it.title == "Settings" })
+                return
+            }
+            prefs.edit().putBoolean("want", true).apply()
+            Dash.startService(this, DashService.ACTION_CONNECT)
+        }
     }
 
     private fun sendCommand(label: String, code: String) {
@@ -487,48 +603,26 @@ class MainActivity : Activity() {
     private fun startLog() {
         if (engine.state != Engine.State.CONNECTED) return toast("Connect first")
         val keys = (pages[currentPage].keys + CORE_LOG).distinct()
-        val derived = listOf(Derived.TGAP, Derived.SLIP, Derived.GEAR_CALC, Derived.FUEL_FLOW)
         try {
-            val lg = CsvLogger(this, keys + derived, pages[currentPage].title.replace(' ', '_').replace("&", "and"))
-            engine.logKeys = keys.toSet()
-            engine.logger = lg
-            logBtn.text = "Stop log"
-            addEvent("Logging: ${lg.fileName}")
+            Dash.startLog(this, keys, pages[currentPage].title.replace(' ', '_').replace("&", "and"))
         } catch (e: Exception) {
             val msg = "Log failed: ${e.javaClass.simpleName} ${e.message}"
-            addEvent(msg)
+            Dash.addEvent(msg)
             Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun stopLog() {
-        val lg = engine.logger ?: return
-        engine.logger = null
-        engine.logKeys = emptySet()
-        lg.close()
-        if (::logBtn.isInitialized) logBtn.text = "Start log"
-        addEvent("Saved ${lg.fileName} (${lg.rows} rows). Share it from the Logs tab." + (lg.error?.let { " Write error: $it" } ?: ""))
-        val f = lg.file
-        val app = applicationContext
-        Thread {
-            val msg = try { "Copy in " + CsvLogger.exportToDownloads(app, f) } catch (e: Exception) {
-                "Downloads copy failed (${e.javaClass.simpleName}: ${e.message}). Use Share on the Logs tab."
-            }
-            ui.post { addEvent(msg) }
-        }.start()
-    }
+    private fun stopLog() = Dash.stopLog(this)
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
-    private fun addEvent(s: String) {
-        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
-        events.add("$t  $s")
-        while (events.size > 200) events.removeAt(0)
+    private fun onEvent(s: String) {
         refreshEvents()
-        if (s.startsWith("Connect") || s.startsWith("Link") || s.startsWith("Saved") || s.startsWith("Logging")) toast(s)
+        if (resumed && (s.startsWith("Connected") || s.startsWith("Link") || s.startsWith("Saved") || s.startsWith("Logging") || s.startsWith("Disconnected")))
+            toast(s)
     }
 
-    private fun refreshEvents() { eventsView?.text = events.takeLast(60).reversed().joinToString("\n") }
+    private fun refreshEvents() { eventsView?.text = Dash.events.takeLast(80).reversed().joinToString("\n") }
 
     private fun appendTerminal(s: String) {
         val o = terminalOut ?: return
@@ -544,39 +638,89 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Latest value of [key] if it was read in the last [maxAgeMs], else null. */
+    private fun fresh(key: String, maxAgeMs: Long, now: Long): Double? {
+        val st = engine.stamps[key] ?: return null
+        if (now - st > maxAgeMs) return null
+        return engine.values[key]?.takeIf { !it.isNaN() }
+    }
+
     private fun refresh() {
         val v = engine.values
         val now = System.currentTimeMillis()
-        status.text = when (engine.state) {
-            Engine.State.CONNECTED -> "Connected  " + engine.linkLabel
-            Engine.State.CONNECTING -> "Connecting to " + engine.linkLabel + " ..."
-            Engine.State.ERROR -> "Not connected (error, see Settings)"
-            Engine.State.IDLE -> "Not connected"
+        val st = engine.state
+        if (st != lastState) {
+            lastState = st
+            val (txt, col) = when (st) {
+                Engine.State.CONNECTED -> "CONNECTED" to Theme.OK
+                Engine.State.CONNECTING -> "CONNECTING" to Theme.WARN
+                Engine.State.WAITING -> "WAITING FOR CAR" to Theme.WARN
+                Engine.State.ERROR -> "NOT CONNECTED" to Theme.BAD
+                Engine.State.IDLE -> "NOT CONNECTED" to Theme.BAD
+            }
+            status.text = txt
+            status.setTextColor(col)
+            pill.background = Theme.fill(Theme.withAlpha(col, 28), dpf(12f), Theme.withAlpha(col, 90))
+            pillDot.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col) }
         }
-        status.setTextColor(if (engine.state == Engine.State.CONNECTED) Theme.OK else Theme.WARN)
-        connectBtn.text = if (engine.state == Engine.State.CONNECTED || engine.state == Engine.State.CONNECTING) "Disconnect" else "Connect"
-        rate.text = if (engine.state == Engine.State.CONNECTED)
-            String.format("%.1f req/s   screen refresh %.1f s", engine.requestsPerSecond, engine.cycleMs / 1000.0) +
-                (engine.logger?.let { "   LOG ${it.rows}" } ?: "") else ""
-        for (g in gauges) g.value = v[g.key]
+        val label = if (Dash.active()) "Disconnect" else "Connect"
+        if (connectBtn.text.toString() != label) connectBtn.text = label
+        rate.text = if (st == Engine.State.CONNECTED) String.format("%.1f req/s  %.1f s", engine.requestsPerSecond, engine.cycleMs / 1000.0) else ""
+        val lg = engine.logger
+        if (lg != null) {
+            if (logStart == 0L) logStart = now
+            val sec = ((now - logStart) / 1000).toInt()
+            logBtn.text = String.format("REC %02d:%02d", sec / 60, sec % 60)
+            if (!loggingShown) {
+                loggingShown = true
+                logBtn.setTextColor(Color.rgb(252, 165, 165))
+                logBtn.background = Theme.fill(Color.argb(38, 239, 68, 68), dpf(12f), Color.argb(150, 239, 68, 68))
+            }
+        } else if (loggingShown) {
+            loggingShown = false
+            logStart = 0L
+            logBtn.text = "Start log"
+            logBtn.setTextColor(Theme.TEXT)
+            logBtn.background = Theme.fill(Color.argb(16, 255, 255, 255), dpf(12f), Color.argb(26, 255, 255, 255))
+        }
+
+        // gauges and tiles: values older than 15 s show as stale
+        for (g in gauges) g.value = fresh(g.key, 15000, now)
         for ((t, f) in tiles) {
             val x = v[t.key]
             t.numeric = x
             t.text = f(x)
-            val st = engine.stamps[t.key]
-            t.stale = Pids[t.key] != null && (st == null || now - st > 8000)
+            val s = engine.stamps[t.key]
+            t.stale = Pids[t.key] != null && (s == null || now - s > 15000)
             t.invalidate()
         }
         for (l in lamps) l.on = v[l.key]?.let { it >= 0.5 }
         for (bv in bars) bv.value = v[bv.key]
-        // alarms
-        val ect = v["ECT_F"]
-        val rpm = v["RPM_E"]
-        val alarm = (ect != null && ect > 225) || (rpm != null && rpm > 6350)
-        topBar.setBackgroundColor(if (alarm && (now / 400) % 2 == 0L) Color.rgb(120, 10, 10) else Color.rgb(18, 16, 20))
-        if (alarm && now - lastAlarm > 4000) {
-            lastAlarm = now
-            try { tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 300) } catch (_: Exception) {}
+
+        // shift lights and rpm flash: VTEC engaged or above 5000 rpm
+        val rpm = fresh("RPM_E", 5000, now)
+        val vtec = fresh("VTEC", 5000, now)
+        val flash = (rpm != null && rpm > 5000) || (vtec != null && vtec >= 0.5)
+        shiftBar.rpm = rpm
+        shiftBar.flash = flash
+        rpmGauge?.let { it.flash = flash; it.badge = if (it.peak > 0) "MAX " + Math.round(it.peak) else "MAX --" }
+        speedGauge?.let { it.badge = if (it.peak >= 0) "TOP " + Math.round(it.peak) else "TOP --" }
+        val ect = fresh("ECT_F", 30000, now)
+        coolantGauge?.let {
+            it.alarm = ect != null && ect > DashService.HOT_F
+            it.badge = when { ect == null -> "STANDBY"; ect > DashService.HOT_F -> "HOT"; ect < 160 -> "COLD"; else -> "NORMAL" }
+        }
+        // alarm: header blinks red (the service plays the sound)
+        val alarm = (ect != null && ect > DashService.HOT_F) || (rpm != null && rpm > DashService.HIGH_RPM)
+        val blink = alarm && (now / 400) % 2 == 0L
+        if (blink != headerRed) {
+            headerRed = blink
+            header.background = if (blink) Theme.fill(Color.rgb(120, 10, 16), dpf(14f), Theme.BAD)
+                else Theme.fill(Theme.withAlpha(Theme.BAR, 235), dpf(14f), Color.argb(26, 255, 255, 255))
         }
     }
+
+    private var logStart = 0L
+    private var loggingShown = false
+    private var headerRed = false
 }

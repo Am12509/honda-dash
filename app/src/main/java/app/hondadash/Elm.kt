@@ -19,9 +19,11 @@ class Elm(private val link: Link, private val log: (String) -> Unit) {
         // First OBD request starts the 5-baud K-line wake-up. It can take several seconds.
         val r = cmd("0100", 12000)
         log("Init 0100: ${clean(r)}")
-        if (!clean(r).startsWith("4100")) {
+        if (!clean(r).contains("4100")) {
             val r2 = cmd("0100", 12000)
             log("Init retry: ${clean(r2)}")
+            // no answer twice: the ECU is off or asleep, so the caller waits and tries again
+            if (!clean(r2).contains("4100")) throw java.io.IOException("ECU not answering (ignition off?)")
         }
     }
 
