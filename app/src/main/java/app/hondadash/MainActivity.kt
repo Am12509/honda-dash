@@ -5,7 +5,9 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.bluetooth.BluetoothManager
+import android.content.ClipData
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -29,6 +31,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
 
 class MainActivity : Activity() {
     private val engine = Engine { msg -> ui.post { addEvent(msg) } }
@@ -274,6 +277,7 @@ class MainActivity : Activity() {
                 note("Driving straight, all four wheel speeds should match within 1-2 km/h. An odd one points at the VSA sensor fault."))
         },
         Page("Diag", emptyList()) { b -> buildDiag(b) },
+        Page("Logs", emptyList()) { b -> buildLogs(b) },
         Page("Settings", emptyList()) { b -> buildSettings(b) },
     )
 
@@ -353,7 +357,68 @@ class MainActivity : Activity() {
         eventsView = ev
         refreshEvents()
         b.addView(ScrollView(this).apply { setBackgroundColor(Theme.PANEL); addView(ev) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.5f))
-        b.addView(note("Honda Dash " + versionName() + "   Logs: Download/HondaDash"), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.4f))
+        b.addView(note("Honda Dash " + versionName() + "   Logs: Logs tab (copies also go to Download/HondaDash)"), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.4f))
+    }
+
+    private fun buildLogs(b: LinearLayout) {
+        row(b, 0.8f, actionButton("Share latest") { CsvLogger.list(this).firstOrNull()?.let { share(it) } ?: toast("No logs yet") },
+            actionButton("Copy all to Downloads") { exportAll() },
+            actionButton("Refresh") { showPage(currentPage) })
+        val files = CsvLogger.list(this)
+        b.addView(note(if (files.isEmpty()) "No logs yet. Press Start log on any screen, drive, then Stop log."
+            else "${files.size} logs. Tap Share to send one to WhatsApp, Gmail, Drive or a file manager."),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.4f))
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for (f in files.take(60)) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            val kb = (f.length() + 1023) / 1024
+            r.addView(note(f.name.removePrefix("HondaDash_").removeSuffix(".csv") + "   " + kb + " KB").apply { setTextColor(Theme.TEXT) },
+                LinearLayout.LayoutParams(0, dp(52), 3f))
+            r.addView(actionButton("Share") { share(f) }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) })
+            r.addView(actionButton("Delete") { confirmDelete(f) }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) })
+            list.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        b.addView(ScrollView(this).apply { setBackgroundColor(Theme.PANEL); addView(list) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 4f))
+    }
+
+    private fun share(f: File) {
+        try {
+            val uri = LogProvider.uriFor(f)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/csv"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, f.name)
+                clipData = ClipData.newRawUri(f.name, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "Share " + f.name).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        } catch (e: Exception) {
+            toast("Share failed: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    private fun confirmDelete(f: File) {
+        AlertDialog.Builder(this).setTitle("Delete this log?").setMessage(f.name)
+            .setPositiveButton("Delete") { _, _ -> f.delete(); showPage(currentPage) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun exportAll() {
+        val files = CsvLogger.list(this)
+        if (files.isEmpty()) return toast("No logs yet")
+        Thread {
+            var ok = 0
+            var err = ""
+            for (f in files) {
+                try { CsvLogger.exportToDownloads(this, f); ok++ } catch (e: Exception) { err = "${e.javaClass.simpleName}: ${e.message}" }
+            }
+            ui.post {
+                val msg = if (err.isEmpty()) "Copied $ok logs to Download/HondaDash" else "Copied $ok of ${files.size}. Downloads error: $err"
+                addEvent(msg)
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+        }.start()
     }
 
     private fun versionName(): String = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
@@ -428,9 +493,11 @@ class MainActivity : Activity() {
             engine.logKeys = keys.toSet()
             engine.logger = lg
             logBtn.text = "Stop log"
-            addEvent("Logging to Download/HondaDash/${lg.fileName}")
+            addEvent("Logging: ${lg.fileName}")
         } catch (e: Exception) {
-            toast("Log failed: ${e.message}")
+            val msg = "Log failed: ${e.javaClass.simpleName} ${e.message}"
+            addEvent(msg)
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -440,7 +507,15 @@ class MainActivity : Activity() {
         engine.logKeys = emptySet()
         lg.close()
         if (::logBtn.isInitialized) logBtn.text = "Start log"
-        addEvent("Saved ${lg.fileName} (${lg.rows} rows)")
+        addEvent("Saved ${lg.fileName} (${lg.rows} rows). Share it from the Logs tab." + (lg.error?.let { " Write error: $it" } ?: ""))
+        val f = lg.file
+        val app = applicationContext
+        Thread {
+            val msg = try { "Copy in " + CsvLogger.exportToDownloads(app, f) } catch (e: Exception) {
+                "Downloads copy failed (${e.javaClass.simpleName}: ${e.message}). Use Share on the Logs tab."
+            }
+            ui.post { addEvent(msg) }
+        }.start()
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
