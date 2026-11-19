@@ -525,10 +525,10 @@ class MainActivity : Activity() {
                 val next = when { window <= 60_000L -> 120_000L; window <= 120_000L -> 300_000L; else -> 60_000L }
                 prefs.edit().putLong("graph_win", next).apply(); showPage(currentPage) },
             info)
-        // 10 ms recorder (ECU file v5.4 and newer). Older files: one short line instead of dead buttons.
+        // 10 ms recorder (ECU file v5.3 and newer). Older files: one short line instead of dead buttons.
         val recOk = engine.ecuFeat and Proto.F_RECORDER != 0
         if (!recOk) {
-            b.addView(note("10 ms recorder: needs ECU file v5.4 or newer" + fileText() + ". The buttons appear once that file is flashed."),
+            b.addView(note("10 ms recorder: needs ECU file v5.3 or newer" + fileText() + ". The buttons appear once that file is flashed."),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
         } else {
             val recInfo = note("10 ms recorder: ready")
@@ -608,8 +608,8 @@ class MainActivity : Activity() {
 
     private fun buildTune(b: LinearLayout) {
         val ok = engine.ecuFeat and Proto.F_TUNING != 0
-        b.addView(note(if (ok) "Live tuning: changes apply at once and last until the ignition is off or codes are cleared. Stock = the value in the file. Rev limits are locked."
-            else "Live tuning needs ECU file v5.5 or newer" + fileText() + ". The controls switch on by themselves once that file is flashed."),
+        b.addView(note(if (ok) "Live tuning: changes apply at once and last until the ignition is off. Stock = the value in the file. Rev limits are locked. Raise timing one step at a time with a log running."
+            else "Live tuning needs ECU file v5.3 or newer" + fileText() + ". The controls switch on by themselves once that file is flashed."),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)))
         val col = scrollColumn(b)
         for (t in Proto.tunables) {
@@ -636,7 +636,7 @@ class MainActivity : Activity() {
     }
 
     private fun sendTune(t: Proto.Tunable, value: Double?) {
-        if (engine.ecuFeat and Proto.F_TUNING == 0) return toast("Needs ECU file v5.5 or newer")
+        if (engine.ecuFeat and Proto.F_TUNING == 0) return toast("Needs ECU file v5.3 or newer")
         if (engine.state != Engine.State.CONNECTED) return toast("Connect first")
         if (value != null) {
             val err = Proto.check(t, value) { id -> Proto.tunables.firstOrNull { it.id == id }?.let { tuneNow(it) } }
