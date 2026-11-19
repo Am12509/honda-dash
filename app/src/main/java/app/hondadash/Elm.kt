@@ -17,10 +17,10 @@ class Elm(private val link: Link, private val log: (String) -> Unit) {
         log("Adapter: $version")
         for (c in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATSP3", "ATAT2")) cmd(c, 1500)
         // First OBD request starts the 5-baud K-line wake-up. It can take several seconds.
-        val r = cmd("0100", 12000)
+        val r = cmd("0100", 9000)
         log("Init 0100: ${clean(r)}")
         if (!clean(r).contains("4100")) {
-            val r2 = cmd("0100", 12000)
+            val r2 = cmd("0100", 7000)
             log("Init retry: ${clean(r2)}")
             // no answer twice: the ECU is off or asleep, so the caller waits and tries again
             if (!clean(r2).contains("4100")) throw java.io.IOException("ECU not answering (ignition off?)")
@@ -73,6 +73,34 @@ class Elm(private val link: Link, private val log: (String) -> Unit) {
             out[k] = b
         }
         return out
+    }
+
+    /**
+     * Request answered with several frames ("62 01 kk d0 d1 d2 d3" per frame, like a VIN read).
+     * Returns frame number -> 4 data bytes, or null when nothing came back.
+     */
+    fun requestFrames(req: String, frames: Int, timeoutMs: Long = 3000): Map<Int, IntArray>? {
+        val sent = if (fastMode && frames in 1..15) req + Integer.toHexString(frames).uppercase() else req
+        val raw = cmd(sent, timeoutMs)
+        val head = "62" + req.substring(2, 4)
+        val out = HashMap<Int, IntArray>()
+        for (line in raw.split('\r', '\n')) {
+            val t = clean(line)
+            val at = t.indexOf(head)
+            if (at < 0) continue
+            val body = t.substring(at + 4)
+            if (body.length < 10) continue
+            val k = body.substring(0, 2).toIntOrNull(16) ?: continue
+            val d = IntArray(4)
+            var ok = true
+            for (i in 0 until 4) {
+                val b = body.substring(2 + 2 * i, 4 + 2 * i).toIntOrNull(16)
+                if (b == null) { ok = false; break }
+                d[i] = b
+            }
+            if (ok) out[k] = d
+        }
+        return if (out.isEmpty()) null else out
     }
 
     /** Mode 23 command to the v5.x handler. Returns true when the ECU confirmed it. */
