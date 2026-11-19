@@ -11,6 +11,8 @@ class Pid(
     val min: Double,
     val max: Double,
     val decimals: Int,
+    /** Group shown in the Graph screen's value picker. */
+    val category: String = "Other",
 ) {
     val expr: Expr by lazy { Expr(equation) }
 
@@ -40,8 +42,14 @@ object Derived {
     const val TGAP = "D_TGAP"          // map timing minus final timing, degrees
     const val FUEL_FLOW = "D_FFLOW"    // fuel per injection x rpm, raw flow index until the scale is proven
     const val RATE = "D_RATE"          // adapter requests per second, logged so link speed is visible
+    const val FUEL_LH = "D_FUEL_LH"    // fuel flow now, litres per hour (trip computer)
+    const val KML = "D_KML"            // fuel economy now, km per litre (trip computer)
     val names = mapOf(SLIP to "Converter slip(%)", GEAR_CALC to "Gear (from shafts)",
-        TGAP to "Timing removed(deg)", FUEL_FLOW to "Fuel flow index (raw)", RATE to "Link rate(req/s)")
+        TGAP to "Timing removed(deg)", FUEL_FLOW to "Fuel flow index (raw)", RATE to "Link rate(req/s)",
+        FUEL_LH to "Fuel flow(L/h)", KML to "Fuel economy now(km/L)")
+    val units = mapOf(SLIP to "%", TGAP to "deg", FUEL_LH to "L/h", KML to "km/L", RATE to "req/s")
+    /** Derived values offered on the Graph screen. */
+    val graphKeys = listOf(FUEL_LH, KML, TGAP, SLIP, GEAR_CALC)
 
     // Mainshaft / countershaft ratio per gear, proven from Log C1 (17 Nov 2026).
     private val ratios = doubleArrayOf(2.656, 1.516, 1.082, 0.772, 0.566)
@@ -60,8 +68,10 @@ object Derived {
         if (tm != null && tf != null) v[TGAP] = tm - tf else v.remove(TGAP)
         val fe = g("FUEL_EVT")
         val rpm = g("RPM_E")
-        if (fe != null && rpm != null) v[FUEL_FLOW] = fe * rpm / 1000.0 else v.remove(FUEL_FLOW)
-        if (eng != null && main != null && eng > 300) v[SLIP] = (eng - main) / eng * 100.0 else v.remove(SLIP)
+        val cut = g("DFCO")
+        if (fe != null && rpm != null) v[FUEL_FLOW] = if (cut != null && cut >= 0.5) 0.0 else fe * rpm / 1000.0 else v.remove(FUEL_FLOW)
+        // slip only means something with the car moving in gear (in P/N the shaft readings are not updated)
+        if (eng != null && main != null && eng > 300 && cs != null && cs > 150) v[SLIP] = (eng - main) / eng * 100.0 else v.remove(SLIP)
         if (main != null && cs != null && cs > 150) {
             val r = main / cs
             var best = 0

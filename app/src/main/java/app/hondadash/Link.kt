@@ -19,8 +19,13 @@ interface Link {
     val label: String
 }
 
+/**
+ * Bluetooth SPP link. [preferred] is the socket method that worked last time (tried first), [onWorked] stores
+ * the method that connected. Each attempt gives up after [CONNECT_TIMEOUT_MS] instead of hanging.
+ */
 @SuppressLint("MissingPermission")
-class BluetoothLink(private val device: BluetoothDevice) : Link {
+class BluetoothLink(private val device: BluetoothDevice, private val preferred: Int = 0,
+                    private val onWorked: ((Int) -> Unit)? = null) : Link {
     private var socket: BluetoothSocket? = null
     private var input: InputStream? = null
     private var output: OutputStream? = null
@@ -38,21 +43,42 @@ class BluetoothLink(private val device: BluetoothDevice) : Link {
             },
         )
         var last: Exception? = null
-        for (make in attempts) {
+        val order = (listOf(preferred) + attempts.indices).distinct().filter { it in attempts.indices }
+        for (i in order) {
+            var s: BluetoothSocket? = null
             try {
-                val s = make()
-                s.connect()
+                s = attempts[i]()
+                connectWithTimeout(s)
                 socket = s
                 input = s.inputStream
                 output = s.outputStream
+                onWorked?.invoke(i)
                 return
             } catch (e: Exception) {
                 last = e
-                try { socket?.close() } catch (_: Exception) {}
+                try { s?.close() } catch (_: Exception) {}
                 socket = null
             }
         }
         throw IOException("Bluetooth connect failed: ${last?.message}")
+    }
+
+    /** BluetoothSocket.connect() can block for a long time when the adapter is off. Close it after the timeout. */
+    private fun connectWithTimeout(s: BluetoothSocket) {
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
+        val guard = Thread {
+            try {
+                Thread.sleep(CONNECT_TIMEOUT_MS)
+                if (!done.get()) try { s.close() } catch (_: Exception) {}
+            } catch (_: InterruptedException) {}
+        }
+        guard.isDaemon = true
+        guard.start()
+        try { s.connect() } finally { done.set(true); guard.interrupt() }
+    }
+
+    companion object {
+        const val CONNECT_TIMEOUT_MS = 8000L
     }
 
     override fun write(s: String) {
@@ -93,11 +119,28 @@ class BluetoothLink(private val device: BluetoothDevice) : Link {
  * A fake adapter and ECU for testing the screens without the car. It answers AT commands, mode 01,
  * mode 22 RAM reads (from a simulated RAM map) and mode 23 commands like the v5.2 file.
  */
-class DemoLink : Link {
+class DemoLink(private val proto: Int = 0x55, private val feat: Int = 0x1F) : Link {
     override val label = "Demo (no car)"
     private var pending: String = ""
     private val ram = HashMap<Int, Int>()
     private val t0 = System.currentTimeMillis()
+    // Honda Dash ECU protocol v1 emulation (see Proto.kt), so the app can be tested without the new file
+    private val slots = IntArray(32)
+    private var ptr = 0
+    private var slotHi = 0
+    private var tuneId = 0
+    private var tuneHi = 0
+    private var recBuf = ByteArray(0)
+    /** Every snapshot request answered, for tests. */
+    var snapshots = 0
+        private set
+
+    init {
+        ram[0x6039] = proto
+        ram[0x603A] = if (proto == 0) 0 else feat
+    }
+
+    private fun byteAt(a: Int): Int = ram[a] ?: 0
 
     override fun open() {}
     override fun close() {}
@@ -121,6 +164,21 @@ class DemoLink : Link {
         w16(0xBC46, 880 + (20 * Math.sin(t / 20)).toInt())
         w16(0xB6C8, 280); w16(0xD742, if (rpm > 3000) 110 else 280)
         w16(0xCF40, (rpm / 3).coerceAtMost(65535))
+        ram[0xB618] = 0
+        w16(0xBC62, (rpm / 40).coerceAtMost(255))
+    }
+
+    private fun frames(mode2: String, data: ByteArray): String {
+        val sb = StringBuilder()
+        var k = 1
+        var i = 0
+        while (i < data.size) {
+            if (sb.isNotEmpty()) sb.append('\r')
+            sb.append("62").append(mode2).append(String.format("%02X", k))
+            for (j in 0 until 4) sb.append(String.format("%02X", if (i + j < data.size) data[i + j].toInt() and 0xFF else 0))
+            i += 4; k++
+        }
+        return sb.toString()
     }
 
     override fun readUntilPrompt(timeoutMs: Long): String {
@@ -158,6 +216,19 @@ class DemoLink : Link {
             }
             0x22 -> {
                 val base = hex.substring(2, 6).toInt(16)
+                if (proto != 0 && base == 0x0100 && feat and Proto.F_SNAPSHOT != 0) {
+                    snapshots++
+                    val n = byteAt(0x603F).coerceIn(0, 30)
+                    val d = ByteArray(((n + 1) / 2) * 4)
+                    for (i in 0 until n) { d[i * 2] = byteAt(slots[i]).toByte(); d[i * 2 + 1] = byteAt(slots[i] + 1).toByte() }
+                    return if (n == 0) "NO DATA" else frames("01", d)
+                }
+                if (proto != 0 && hex.length >= 6 && hex.startsWith("2202") && feat and Proto.F_RECORDER != 0) {
+                    val b = hex.substring(4, 6).toInt(16)
+                    val d = ByteArray(60)
+                    for (i in 0 until 60) { val o = b * 60 + i; if (o < recBuf.size) d[i] = recBuf[o] }
+                    return frames("02", d)
+                }
                 val sb = StringBuilder("62" + hex.substring(2, 6))
                 for (k in 0 until 4) sb.append(String.format("%02X", ram[base + k] ?: 0))
                 sb.toString()
@@ -165,7 +236,30 @@ class DemoLink : Link {
             0x23 -> {
                 val cmd = hex.substring(2, 4).toInt(16)
                 val v = if (hex.length >= 6) hex.substring(4, 6).toInt(16) else 0
+                if (proto == 0 && cmd >= 0x10) return "NO DATA"
                 when (cmd) {
+                    0x10 -> { ram[0x603F] = v.coerceAtMost(30) }
+                    0x11 -> { ptr = v.coerceIn(0, 31) }
+                    0x12 -> { slotHi = v }
+                    0x13 -> { slots[ptr] = (slotHi shl 8) or v; if (ptr < 31) ptr++ }
+                    0x20 -> {
+                        if (v == 0) { ram[0x603B] = 0; ram[0x603D] = 0; ram[0x603E] = 0; recBuf = ByteArray(0) }
+                        else {
+                            // demo: the whole recording is made at once (300 samples, 10 ms apart)
+                            val k = byteAt(0x603F).coerceIn(1, Proto.REC_SLOTS)
+                            val n = 300
+                            recBuf = ByteArray(n * k * 2)
+                            for (i in 0 until n) {
+                                val rpm = 2000 + i * 12
+                                w16(0xBC9A, rpm); w16(0xD742, 100 + i); w16(0xCF40, rpm / 3)
+                                for (j in 0 until k) { recBuf[(i * k + j) * 2] = byteAt(slots[j]).toByte(); recBuf[(i * k + j) * 2 + 1] = byteAt(slots[j] + 1).toByte() }
+                            }
+                            ram[0x603B] = 3; ram[0x603C] = k; ram[0x603D] = n shr 8; ram[0x603E] = n and 0xFF
+                        }
+                    }
+                    0x30 -> { tuneId = v.coerceIn(0, 31) }
+                    0x31 -> { tuneHi = v }
+                    0x32 -> { ram[0x6040 + 2 * tuneId] = tuneHi; ram[0x6041 + 2 * tuneId] = v }
                     0x03 -> { ram[0x6012] = if (v == 1 || v == 2) v else 0 }
                     0x07 -> { ram[0x6023] = v }
                     0x08 -> { ram[0x6024] = v }
