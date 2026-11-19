@@ -34,9 +34,13 @@ class DashService : Service() {
     private val wakeUp = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             // Bluetooth just came back on (head unit woke up): retry now instead of waiting for the next attempt
+            if (i.action == Intent.ACTION_SCREEN_OFF) { Dash.engine.allowSlow = true; return }
+            if (i.action == Intent.ACTION_SCREEN_ON) Dash.engine.allowSlow = false
             val on = i.action != BluetoothAdapter.ACTION_STATE_CHANGED ||
                 i.getIntExtra(BluetoothAdapter.EXTRA_STATE, 0) == BluetoothAdapter.STATE_ON
-            if (on && wants() && Dash.engine.state == Engine.State.WAITING) Dash.engine.retryNow()
+            if (!on || !wants()) return
+            if (!Dash.active()) Dash.connect(this@DashService)
+            else if (Dash.engine.state == Engine.State.WAITING) Dash.engine.retryNow()
         }
     }
 
@@ -44,6 +48,7 @@ class DashService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Dash.init(this)
         val nm = getSystemService(NotificationManager::class.java)
         if (nm != null) {
             nm.createNotificationChannel(NotificationChannel(CH_STATUS, "Connection status", NotificationManager.IMPORTANCE_LOW).apply {
@@ -59,24 +64,17 @@ class DashService : Service() {
         f.addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
         f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
         f.addAction(Intent.ACTION_SCREEN_ON)
+        f.addAction(Intent.ACTION_SCREEN_OFF)
         try { registerReceiver(wakeUp, f) } catch (_: Exception) {}
         lastConnects = Dash.engine.connectCount
         ui.post(tick)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val p = Dash.prefs(this)
         when (intent?.action) {
-            ACTION_CONNECT -> {
-                p.edit().putBoolean("want", true).apply()
-                Dash.connect(this)
-            }
-            ACTION_DISCONNECT -> {
-                p.edit().putBoolean("want", false).apply()
-                Dash.disconnect(this)
-            }
+            ACTION_CONNECT -> Dash.connect(this)
+            ACTION_DISCONNECT -> Dash.disconnect(this)
             ACTION_EXIT -> {
-                p.edit().putBoolean("want", false).apply()
                 Dash.disconnect(this)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -95,10 +93,12 @@ class DashService : Service() {
         super.onDestroy()
     }
 
-    private fun wants(): Boolean = Dash.prefs(this).getBoolean("want", false)
+    private fun wants(): Boolean = Dash.wants(this)
 
     private val tick = object : Runnable {
         override fun run() {
+            // self-heal: auto connect wanted but nothing running (for example after the service was restarted)
+            if (wants() && !Dash.active()) Dash.connect(this@DashService)
             refresh(false)
             alarms()
             ui.postDelayed(this, 1000)
@@ -129,7 +129,11 @@ class DashService : Service() {
             Engine.State.CONNECTING -> "Connecting..."
             Engine.State.WAITING -> "Waiting for the car (ignition off?)"
             Engine.State.ERROR -> "Not connected (error)"
-            Engine.State.IDLE -> if (wants()) "Starting..." else "Disconnected. Tap Connect to start."
+            Engine.State.IDLE -> when {
+                wants() -> "Starting..."
+                !Dash.prefs(this).getBoolean("auto", true) -> "Auto connect is off. Tap Connect to start."
+                else -> "Disconnected. Tap Connect to start."
+            }
         }
     }
 
@@ -226,6 +230,6 @@ class DashService : Service() {
 /** Starts the service after the head unit or phone boots, if the user was connected before. */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
-        if (Dash.prefs(c).getBoolean("want", false)) Dash.startService(c)
+        if (Dash.prefs(c).getBoolean("auto", true)) Dash.startService(c)
     }
 }
