@@ -30,9 +30,9 @@ object Proto {
 
     const val F_PN_POPS = 1        // pops start at throttle close in P/N (v5.3)
     const val F_LEVEL_PULSE = 2    // speedometer pulses on every pop level change (v5.3)
-    const val F_SNAPSHOT = 4       // 220100 multi-frame snapshot (v5.4)
-    const val F_RECORDER = 8       // 10 ms recorder (v5.4)
-    const val F_TUNING = 16        // live tuning table (v5.5)
+    const val F_SNAPSHOT = 4       // 220100 multi-frame snapshot (v5.3)
+    const val F_RECORDER = 8       // 10 ms recorder (v5.3, 2 KB: 128 samples of 8 values)
+    const val F_TUNING = 16        // live tuning table (v5.3)
 
     /** Mode 22 address of a request like "22D742", or -1 for other requests. */
     fun address(request: String): Int =
@@ -71,7 +71,7 @@ object Proto {
     class Tunable(val id: Int, val key: String, val name: String, val unit: String,
                   val min: Double, val max: Double, val step: Double, val scale: Double = 1.0, val signed: Boolean = false)
 
-    /** Rev limits are not tunable. Upshifts stay at least 500 rpm under the 6500 soft cut. */
+    /** Rev limits are not tunable. Upshifts stay at least 500 rpm under the 6500 soft cut. Timing: regular fuel cap. */
     val tunables = listOf(
         Tunable(0, "TUNE_VTEC_A_ON", "VTEC on, map A", "rpm", 3000.0, 6000.0, 100.0),
         Tunable(1, "TUNE_VTEC_A_OFF", "VTEC off, map A", "rpm", 2800.0, 5800.0, 100.0),
@@ -84,6 +84,8 @@ object Proto {
         Tunable(8, "TUNE_FAN_ON", "Fan on", "C", 88.0, 100.0, 0.5, 10.0),
         Tunable(9, "TUNE_FAN_OFF", "Fan off", "C", 85.0, 98.0, 0.5, 10.0),
         Tunable(10, "TUNE_IDLE", "Idle speed offset", "rpm", -100.0, 200.0, 25.0, 1.0, true),
+        // raises the factory full-load timing limit (B666). 2.0 deg cap for regular fuel; the ECU clamps it too.
+        Tunable(11, "TUNE_TLIM", "Timing limit raise", "deg", 0.5, 2.0, 0.5, 10.0),
     )
 
     /** Checks a new value against the limits and the related settings. Returns an error text, or null when fine. */

@@ -56,6 +56,7 @@ object PidTable {
         Pid("TUNE_FAN_ON", "Tune: fan on (0 = stock)", "Fan on", "226050", "(A*256+B)/10", "C", 0.0, 120.0, 1, "ECU tuning"),
         Pid("TUNE_FAN_OFF", "Tune: fan off (0 = stock)", "Fan off", "226050", "(C*256+D)/10", "C", 0.0, 120.0, 1, "ECU tuning"),
         Pid("TUNE_IDLE", "Tune: idle speed offset (0 = stock)", "Idle ofs", "226054", "Signed(A)*256+B", "rpm", -200.0, 300.0, 0, "ECU tuning"),
+        Pid("TUNE_TLIM", "Tune: timing limit raise (0 = stock)", "Tim limit", "226054", "(Signed(C)*256+D)/10", "deg", 0.0, 3.0, 1, "ECU tuning"),
         Pid("AC_CLUTCH", "AC clutch", "A/C", "22C62D", "A", "", 0.0, 1.0, 0, "Engine"),
         Pid("BTN_SHIFT", "Button shifting enabled", "Btn shift", "226010", "1-B/90", "", 0.0, 1.0, 0, "Modes, pops, fans"),
         Pid("LOOP", "Closed loop", "Loop", "22BDEF", "A", "", 0.0, 1.0, 0, "Fuel"),
